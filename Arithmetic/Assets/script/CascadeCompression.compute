@@ -1,0 +1,74 @@
+#pragma kernel Init
+#pragma kernel Init2
+#pragma kernel Init3
+#pragma kernel GenerateDict
+#pragma kernel GenerateCulledDict
+#pragma kernel Quantize
+
+
+extern uint e_seed;
+extern uint e_arraySize;
+extern uint e_dictSize;
+groupshared uint g_numberOfSymbols;
+
+RWStructuredBuffer<uint> TempBuffer;
+RWStructuredBuffer<uint> OriginalBuffer;
+RWStructuredBuffer<uint> DictBuffer;
+AppendStructuredBuffer<uint2> CulledDict;
+RWStructuredBuffer<uint> NumberOfSymbols;
+RWStructuredBuffer<uint> QuantizeTest;
+
+uint rand(uint s, uint seed, uint limit)
+{
+    s += seed;
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s & (limit - 1);
+}
+
+[numthreads(1024, 1, 1)]
+void Init (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < e_dictSize)
+    {
+        TempBuffer[id.x] = rand(id.x, e_seed, e_arraySize);
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void Init2(uint3 id : SV_DispatchThreadID)
+{
+    OriginalBuffer[id.x] = TempBuffer[rand(id.x, e_seed, e_dictSize)];
+}
+
+[numthreads(1024, 1, 1)]
+void Init3(uint3 id : SV_DispatchThreadID)
+{
+    DictBuffer[id.x] = 0;
+}
+
+[numthreads(1024, 1, 1)]
+void GenerateDict(uint3 id : SV_DispatchThreadID)
+{
+    InterlockedAdd(DictBuffer[OriginalBuffer[id.x]], 1);
+}
+
+[numthreads(1024, 1, 1)]
+void GenerateCulledDict(uint3 id : SV_DispatchThreadID)
+{
+    if (DictBuffer[id.x] != 0)
+    {
+        InterlockedAdd(g_numberOfSymbols, 1);
+        CulledDict.Append(uint2(id.x, DictBuffer[id.x]));
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void Quantize(uint3 id : SV_DispatchThreadID)
+{
+    QuantizeTest[id.x] = g_numberOfSymbols;
+}
