@@ -132,6 +132,8 @@ void process_last_column(uint curr_thread_id, uint item_count, uint v_2power)
 		/* right_offset */			1
     };
 
+    process_column(curr_thread_id, column);
+    DeviceMemoryBarrierWithGroupSync();
 }
 
 void sort_4(uint curr_thread_id, uint item_count)
@@ -188,5 +190,3 @@ void CSMain (uint3 gtid : SV_GroupThreadID)
     }
 }
 
-[numthreads (1024, 1, 1)]
-void GetFrequency()
