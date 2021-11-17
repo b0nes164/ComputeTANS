@@ -1,4 +1,5 @@
 #pragma kernel Init
+#pragma kernel Quantize
 
 struct dispatch_args
 {
@@ -10,7 +11,7 @@ struct dispatch_args
 struct errorArr
 {
     uint index;
-    double error;
+    float error;
 };
 
 struct sorting_network_column
@@ -40,8 +41,8 @@ RWStructuredBuffer<uint> TempBuffer;
 RWStructuredBuffer<uint> OriginalBuffer;
 RWStructuredBuffer<uint> DictBuffer;
 
-RWStructuredBuffer<double> orig_prob;
-RWStructuredBuffer<double> quant_prob;
+RWStructuredBuffer<float> orig_prob;
+RWStructuredBuffer<float> quant_prob;
 RWStructuredBuffer<uint> quant_round;
 RWStructuredBuffer<errorArr> ErrorCorr;
 
@@ -126,7 +127,7 @@ void process_column(uint curr_thread_id, sorting_network_column column, RWStruct
     }
 }
 
-void process_first_column(uint curr_thread_id, uint item_count, uint v_2power)
+void process_first_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer)
 {
     const sorting_network_column column =
     {
@@ -140,11 +141,11 @@ void process_first_column(uint curr_thread_id, uint item_count, uint v_2power)
 		/* right_offset */			v_2power >> 1
     };
     
-    process_column(curr_thread_id, column);
+    process_column(curr_thread_id, column, inBuffer);
     DeviceMemoryBarrierWithGroupSync();
 }
 
-void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2power, uint column_count)
+void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2power, uint column_count, RWStructuredBuffer<errorArr> inBuffer)
 {
     sorting_network_column column =
     {
@@ -160,7 +161,7 @@ void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2
     
     for (uint ci = 0; ci < column_count; ++ci)
     {
-        process_column(curr_thread_id, column);
+        process_column(curr_thread_id, column, inBuffer);
         DeviceMemoryBarrierWithGroupSync();
 
         column.first_element_index >>= 1;
@@ -171,7 +172,7 @@ void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2
     }
 }
 
-void process_last_column(uint curr_thread_id, uint item_count, uint v_2power)
+void process_last_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer)
 {
     const sorting_network_column column =
     {
@@ -185,11 +186,11 @@ void process_last_column(uint curr_thread_id, uint item_count, uint v_2power)
 		/* right_offset */			1
     };
 
-    process_column(curr_thread_id, column);
+    process_column(curr_thread_id, column, inBuffer);
     DeviceMemoryBarrierWithGroupSync();
 }
 
-void sort_4(uint curr_thread_id, uint item_count)
+void sort_4(uint curr_thread_id, uint item_count, RWStructuredBuffer<errorArr> inBuffer)
 {
     const uint tuple_count = item_count >> 2;
     if (curr_thread_id >= tuple_count)
@@ -208,21 +209,32 @@ void sort_4(uint curr_thread_id, uint item_count)
         const uint idx3 = idx2 + 1;
 
 		// compare and swap: (0, 1) (2, 3) (0, 2) (1, 3) (1, 2) ---
-        compare_and_swap(idx0, idx1);
-        compare_and_swap(idx2, idx3);
-        compare_and_swap(idx0, idx2);
-        compare_and_swap(idx1, idx3);
-        compare_and_swap(idx1, idx2);
+        compare_and_swap(idx0, idx1, inBuffer);
+        compare_and_swap(idx2, idx3, inBuffer);
+        compare_and_swap(idx0, idx2, inBuffer);
+        compare_and_swap(idx1, idx3, inBuffer);
+        compare_and_swap(idx1, idx2, inBuffer);
     }
 }
 
-
-
-
-
-
-
-
+void SortMain(uint3 _gtid, RWStructuredBuffer<errorArr> inBuffer)
+{
+    sort_4(_gtid.x, e_arraySize, inBuffer);
+    DeviceMemoryBarrierWithGroupSync();
+    
+    uint power = 3;
+    uint v_2power = 8;
+    
+    while (v_2power <= e_arraySize)
+    {
+        process_first_column(_gtid.x, e_arraySize, v_2power, inBuffer);
+        process_intermediate_columns(_gtid.x, e_arraySize, v_2power, power - 2, inBuffer);
+        process_last_column(_gtid.x, e_arraySize, v_2power, inBuffer);
+        
+        ++power;
+        v_2power <<= 1;
+    }
+}
 
 
 
@@ -293,7 +305,7 @@ void Quantize(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
  
     //this is the quantized probability, the size of L is equal to the smallest power of two equal to or larger than the number of symbols, then doubled
-    uint bigL = calcL(g_numberOfSymbols);
+    uint bigL = calcL(SymbolCount[0]);
     //for readability
     uint totalSymbolFrame = e_arraySize;
     
@@ -308,12 +320,13 @@ void Quantize(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
     uint tempOne = id.x * threadWorkOne;
     
     //generate initial quantization
-    for (int i = tempOne; i < tempOne + threadWorkOne; i++)
+    for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
     {
         if(DictBuffer[i] != 0)
         {
-            orig_prob[i] = DictBuffer[i] * 1.0 / totalSymbolFrame;
-            quant_prob[i] = DictBuffer[i] * quantMult;
+            orig_prob[i] = DictBuffer[i] * 1.0f / totalSymbolFrame;
+            //change this maybe
+            quant_prob[i] = (float)(DictBuffer[i] * quantMult);
             quant_round[i] = round(quant_prob[i]);
             
             ErrorCorr[i].index = i;
@@ -337,15 +350,18 @@ void Quantize(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
         }
         
         //calculate potential error corrections
-        for (int i = tempOne; i < tempOne + threadWorkOne; i++)
+        for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
         {
             ErrorCorr[i].error = ErrorCorr[i].error - (pow(quant_prob[i] - (quant_round[i] + sign), 2) / orig_prob[i]);
         }
-        
-        
-        
-        
-        
     }
 
+    DeviceMemoryBarrierWithGroupSync();
+    
+    if (g_used != bigL)
+    {
+        SortMain(gtid, ErrorCorr);
+    }
+    
+    DeviceMemoryBarrierWithGroupSync();
 }

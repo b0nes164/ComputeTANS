@@ -2,10 +2,13 @@ Base path: 'C:/Program Files/Unity/Hub/Editor/2021.1.5f1/Editor/Data', plugins p
 Cmd: initializeCompiler
 
 Cmd: compileComputeKernel
-  insize=4367 file=C:/Users/Tom/Documents/GitHub/Arithmetic-Encoding/Arithmetic/Assets/script/CascadeCompression.compute kernel=Init cachingPP=1 ppOnly=0 stripLineD=0 buildPlatform=19 km=<UNITY_VERSION=202115> pKW=UNITY_ENABLE_REFLECTION_BUFFERS UNITY_USE_DITHER_MASK_FOR_ALPHABLENDED_SHADOWS UNITY_PBS_USE_BRDF1 UNITY_SPECCUBE_BOX_PROJECTION UNITY_SPECCUBE_BLENDING UNITY_ENABLE_DETAIL_NORMALMAP SHADER_API_DESKTOP UNITY_COLORSPACE_GAMMA UNITY_LIGHT_PROBE_PROXY_VOLUME UNITY_LIGHTMAP_FULL_HDR uKW=SHADER_STAGE_COMPUTE platform=d3d11 flags=0 reqs=16385 forceDXC=0 forceFXC=0  error: 1 plat 4 at CascadeCompression.compute(143): signed/unsigned mismatch, unsigned assumed
-  error: 1 plat 4 at CascadeCompression.compute(149): 'round': conversion from larger type to smaller, possible loss of data
-  error: 1 plat 4 at CascadeCompression.compute(152): 'pow': conversion from larger type to smaller, possible loss of data
-  error: 1 plat 4 at CascadeCompression.compute(172): signed/unsigned mismatch, unsigned assumed
-  error: 1 plat 4 at CascadeCompression.compute(174): 'pow': conversion from larger type to smaller, possible loss of data
- ok=1 outsize=2405
+  insize=10175 file=C:/Users/Tom/Documents/GitHub/Arithmetic-Encoding/Arithmetic/Assets/script/CascadeCompression.compute kernel=Quantize cachingPP=1 ppOnly=0 stripLineD=0 buildPlatform=19 km=<UNITY_VERSION=202115> pKW=UNITY_ENABLE_REFLECTION_BUFFERS UNITY_USE_DITHER_MASK_FOR_ALPHABLENDED_SHADOWS UNITY_PBS_USE_BRDF1 UNITY_SPECCUBE_BOX_PROJECTION UNITY_SPECCUBE_BLENDING UNITY_ENABLE_DETAIL_NORMALMAP SHADER_API_DESKTOP UNITY_COLORSPACE_GAMMA UNITY_LIGHT_PROBE_PROXY_VOLUME UNITY_LIGHTMAP_FULL_HDR uKW=SHADER_STAGE_COMPUTE platform=d3d11 flags=0 reqs=16385 forceDXC=0 forceFXC=0 ok=1 outsize=2488
+
+Cmd: compileComputeKernel
+  insize=10170 file=C:/Users/Tom/Documents/GitHub/Arithmetic-Encoding/Arithmetic/Assets/script/CascadeCompression.compute kernel=Quantize cachingPP=1 ppOnly=0 stripLineD=0 buildPlatform=19 km=<UNITY_VERSION=202115> pKW=UNITY_ENABLE_REFLECTION_BUFFERS UNITY_USE_DITHER_MASK_FOR_ALPHABLENDED_SHADOWS UNITY_PBS_USE_BRDF1 UNITY_SPECCUBE_BOX_PROJECTION UNITY_SPECCUBE_BLENDING UNITY_ENABLE_DETAIL_NORMALMAP SHADER_API_DESKTOP UNITY_COLORSPACE_GAMMA UNITY_LIGHT_PROBE_PROXY_VOLUME UNITY_LIGHTMAP_FULL_HDR uKW=SHADER_STAGE_COMPUTE platform=d3d11 flags=0 reqs=16385 forceDXC=0 forceFXC=0 ok=1 outsize=2460
+
+Cmd: compileComputeKernel
+  insize=10226 file=C:/Users/Tom/Documents/GitHub/Arithmetic-Encoding/Arithmetic/Assets/script/CascadeCompression.compute kernel=Quantize cachingPP=1 ppOnly=0 stripLineD=0 buildPlatform=19 km=<UNITY_VERSION=202115> pKW=UNITY_ENABLE_REFLECTION_BUFFERS UNITY_USE_DITHER_MASK_FOR_ALPHABLENDED_SHADOWS UNITY_PBS_USE_BRDF1 UNITY_SPECCUBE_BOX_PROJECTION UNITY_SPECCUBE_BLENDING UNITY_ENABLE_DETAIL_NORMALMAP SHADER_API_DESKTOP UNITY_COLORSPACE_GAMMA UNITY_LIGHT_PROBE_PROXY_VOLUME UNITY_LIGHTMAP_FULL_HDR uKW=SHADER_STAGE_COMPUTE platform=d3d11 flags=0 reqs=16385 forceDXC=0 forceFXC=0  error: 2 plat 4 at CascadeCompression.compute(340): potentially uninitialized data accessed at this location; this memory access dependent on potentially uninitialized data
+  error: 2 plat 4 at CascadeCompression.compute(358): thread sync operation found in varying flow control, consider reformulating your algorithm so all threads will hit the sync simultaneously
+ ok=0 outsize=0
 
