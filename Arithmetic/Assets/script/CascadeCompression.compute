@@ -1,5 +1,8 @@
 #pragma kernel Init
 #pragma kernel Quantize
+#pragma kernel CorrectSingle
+#pragma kernel CorrectMulti
+#pragma kernel BinaryTree
 
 struct dispatch_args
 {
@@ -26,26 +29,46 @@ struct sorting_network_column
     uint right_offset;
 };
 
+struct binaryNode
+{
+    uint left;
+    uint right;
+    uint data;
+};
 
-extern uint e_seed;
+extern float e_seed;
 extern uint e_arraySize;
 extern uint e_dictSize;
+extern uint e_binarySize;
 
 groupshared uint g_numberOfSymbols;
 groupshared uint g_used;
 
 RWStructuredBuffer<dispatch_args> DispatchArgs;
+
+// 0 - count of symbols
+// 1 - count of used symbols
+// 2 - L
 RWStructuredBuffer<uint> SymbolCount;
 
 RWStructuredBuffer<uint> TempBuffer;
 RWStructuredBuffer<uint> OriginalBuffer;
 RWStructuredBuffer<uint> DictBuffer;
 
+//the decimal probability of the the original symbol frame
+// (Symbol Frequencies) / (Total Symbol Count)
 RWStructuredBuffer<float> orig_prob;
+//The quantized frequency
+//(original probability) * L
 RWStructuredBuffer<float> quant_prob;
+//The post rounded frequency
+//round(quantized probability)
 RWStructuredBuffer<uint> quant_round;
+//The error created by a possible correction of size x
+//(quant prob - (quant round + x)) ^ 2 / orig prob
 RWStructuredBuffer<errorArr> ErrorCorr;
 
+RWStructuredBuffer<binaryNode> BinaryBuffer;
 static uint s_numthreads = 256;
 
 uint rand(uint s, uint seed, uint limit)
@@ -57,23 +80,28 @@ uint rand(uint s, uint seed, uint limit)
     s *= 2654435769u;
     s ^= s >> 16;
     s *= 2654435769u;
-    return s & (limit - 1);
+    return uint((double(s) / 0x7FFFFFFF) * limit);
+}
+
+uint randTwo(float n, uint limit)
+{
+    return uint(frac(sin(n) * 43758.5453) * limit);
 }
 
 uint calcL(uint symbolCount)
 {
     symbolCount--;
+    uint powerOut = 1;
     
-    uint counter = 0;
-    
-    while (symbolCount >  0)
+    while(symbolCount > 0)
     {
         symbolCount >>= 1;
-        counter++;
+        powerOut *= 2;
     }
 
-    return pow(2, counter + 1);
+    return powerOut;
 }
+
 
 //**************************************************************
 // HLSL Odd Even Merge Sort
@@ -82,21 +110,39 @@ uint calcL(uint symbolCount)
 // Added 9/16/2021
 //**************************************************************
 
-void compare_and_swap(uint l, uint r, RWStructuredBuffer<errorArr> _inBuffer)
+void compare_and_swap(uint l, uint r, RWStructuredBuffer<errorArr> _inBuffer, RWStructuredBuffer<uint> _inQuantRound)
 {
     const errorArr x = _inBuffer[l];
     const errorArr y = _inBuffer[r];
     
-    if (x.error <= y.error)
-    {
+    if (x.error < y.error)
+    {       
         return;
     }
-    
-    _inBuffer[l] = y;
-    _inBuffer[r] = x;
+    else
+    {
+        if (x.error == y.error)
+        {
+            if(_inQuantRound[l] <= _inQuantRound[r])
+            {
+                _inBuffer[l] = y;
+                _inBuffer[r] = x;
+            }
+            else
+            {
+                return;
+            }
+
+        }
+        else
+        {
+            _inBuffer[l] = y;
+            _inBuffer[r] = x;
+        }
+    }
 }
 
-void process_column(uint curr_thread_id, sorting_network_column column, RWStructuredBuffer<errorArr> inBuffer)
+void process_column(uint curr_thread_id, sorting_network_column column, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound)
 {
     const uint comparisons_per_group = column.row_count * column.comparisons_per_row;
     const uint comparison_count = column.group_count * comparisons_per_group;
@@ -123,11 +169,11 @@ void process_column(uint curr_thread_id, sorting_network_column column, RWStruct
 
         const uint l = start_index + column.left_factor * (ci % column.comparisons_per_row);
         const uint r = l + column.right_offset;
-        compare_and_swap(l, r, inBuffer);
+        compare_and_swap(l, r, inBuffer, inQuantRound);
     }
 }
 
-void process_first_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer)
+void process_first_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound)
 {
     const sorting_network_column column =
     {
@@ -141,11 +187,11 @@ void process_first_column(uint curr_thread_id, uint item_count, uint v_2power, R
 		/* right_offset */			v_2power >> 1
     };
     
-    process_column(curr_thread_id, column, inBuffer);
+    process_column(curr_thread_id, column, inBuffer, inQuantRound);
     DeviceMemoryBarrierWithGroupSync();
 }
 
-void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2power, uint column_count, RWStructuredBuffer<errorArr> inBuffer)
+void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2power, uint column_count, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound)
 {
     sorting_network_column column =
     {
@@ -161,7 +207,7 @@ void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2
     
     for (uint ci = 0; ci < column_count; ++ci)
     {
-        process_column(curr_thread_id, column, inBuffer);
+        process_column(curr_thread_id, column, inBuffer, inQuantRound);
         DeviceMemoryBarrierWithGroupSync();
 
         column.first_element_index >>= 1;
@@ -172,7 +218,7 @@ void process_intermediate_columns(uint curr_thread_id, uint item_count, uint v_2
     }
 }
 
-void process_last_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer)
+void process_last_column(uint curr_thread_id, uint item_count, uint v_2power, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound)
 {
     const sorting_network_column column =
     {
@@ -186,11 +232,11 @@ void process_last_column(uint curr_thread_id, uint item_count, uint v_2power, RW
 		/* right_offset */			1
     };
 
-    process_column(curr_thread_id, column, inBuffer);
+    process_column(curr_thread_id, column, inBuffer, inQuantRound);
     DeviceMemoryBarrierWithGroupSync();
 }
 
-void sort_4(uint curr_thread_id, uint item_count, RWStructuredBuffer<errorArr> inBuffer)
+void sort_4(uint curr_thread_id, uint item_count, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound)
 {
     const uint tuple_count = item_count >> 2;
     if (curr_thread_id >= tuple_count)
@@ -209,36 +255,32 @@ void sort_4(uint curr_thread_id, uint item_count, RWStructuredBuffer<errorArr> i
         const uint idx3 = idx2 + 1;
 
 		// compare and swap: (0, 1) (2, 3) (0, 2) (1, 3) (1, 2) ---
-        compare_and_swap(idx0, idx1, inBuffer);
-        compare_and_swap(idx2, idx3, inBuffer);
-        compare_and_swap(idx0, idx2, inBuffer);
-        compare_and_swap(idx1, idx3, inBuffer);
-        compare_and_swap(idx1, idx2, inBuffer);
+        compare_and_swap(idx0, idx1, inBuffer, inQuantRound);
+        compare_and_swap(idx2, idx3, inBuffer, inQuantRound);
+        compare_and_swap(idx0, idx2, inBuffer, inQuantRound);
+        compare_and_swap(idx1, idx3, inBuffer, inQuantRound);
+        compare_and_swap(idx1, idx2, inBuffer, inQuantRound);
     }
 }
 
-void SortMain(uint3 _gtid, RWStructuredBuffer<errorArr> inBuffer)
+void SortMain(uint3 _gtid, RWStructuredBuffer<errorArr> inBuffer, RWStructuredBuffer<uint> inQuantRound, uint sortSize)
 {
-    sort_4(_gtid.x, e_arraySize, inBuffer);
+    sort_4(_gtid.x, sortSize, inBuffer, inQuantRound);
     DeviceMemoryBarrierWithGroupSync();
     
     uint power = 3;
     uint v_2power = 8;
     
-    while (v_2power <= e_arraySize)
+    while (v_2power <= sortSize)
     {
-        process_first_column(_gtid.x, e_arraySize, v_2power, inBuffer);
-        process_intermediate_columns(_gtid.x, e_arraySize, v_2power, power - 2, inBuffer);
-        process_last_column(_gtid.x, e_arraySize, v_2power, inBuffer);
+        process_first_column(_gtid.x, sortSize, v_2power, inBuffer, inQuantRound);
+        process_intermediate_columns(_gtid.x, sortSize, v_2power, power - 2, inBuffer, inQuantRound);
+        process_last_column(_gtid.x, sortSize, v_2power, inBuffer, inQuantRound);
         
         ++power;
         v_2power <<= 1;
     }
 }
-
-
-
-
 
 
 [numthreads(256, 1, 1)]
@@ -247,13 +289,30 @@ void Init(uint3 id : SV_DispatchThreadID)
     uint threadWorkOne = ceil(e_dictSize * 1.0f / s_numthreads);
     uint threadWorkTwo = ceil(e_arraySize * 1.0f / s_numthreads);
     
+    if(id.x == 1)
+    {
+        SymbolCount[0] = 0;
+        SymbolCount[1] = 0;
+        SymbolCount[2] = 0;
+    }
+    
     //first init
-    uint tempOne = id.x * threadWorkOne;
+        uint tempOne = id.x * threadWorkOne;
     for (uint i = tempOne; i < (tempOne + threadWorkOne); i++)
     {
         if (i < e_dictSize)
         {
-            TempBuffer[i] = rand(i, e_seed, e_arraySize);
+            //TempBuffer[i] = rand(i, e_seed, e_arraySize);
+            TempBuffer[i] = randTwo(i + e_seed, e_arraySize);
+            
+            //just make sure 0 isnt a symbol
+            int fixer = 13;
+            while(TempBuffer[i] == 0)
+            {
+                TempBuffer[i] = randTwo(fixer, e_arraySize);
+                fixer++;
+            }
+
         }
     }
     
@@ -267,7 +326,8 @@ void Init(uint3 id : SV_DispatchThreadID)
     {
         if (j < e_arraySize)
         {
-            OriginalBuffer[j] = TempBuffer[rand(j, e_seed, e_dictSize)];
+            OriginalBuffer[j] = TempBuffer[randTwo(j + e_seed, e_dictSize)];
+            //OriginalBuffer[j] = TempBuffer[j];
             DictBuffer[j] = 0;
         }
     }
@@ -300,68 +360,281 @@ void Init(uint3 id : SV_DispatchThreadID)
     }
 }
 
+//prep for corrections
 [numthreads(256, 1, 1)]
 void Quantize(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
- 
-    //this is the quantized probability, the size of L is equal to the smallest power of two equal to or larger than the number of symbols, then doubled
-    uint bigL = calcL(SymbolCount[0]);
-    //for readability
     uint totalSymbolFrame = e_arraySize;
     
-    //the multiplier to get the pre-rounded quantized probability
-    double quantMult = bigL * 1.0 / totalSymbolFrame;
+    //for testing purposes
+    //int L = calcL(SymbolCount[0]);
+    int L = 4096;
+
+    float quantMult = L * 1.0f / totalSymbolFrame;
     
-    uint workCount;
-    uint empty;
-    quant_prob.GetDimensions(workCount, empty);
-    
-    uint threadWorkOne = ceil(workCount * 1.0f / s_numthreads);
+    uint threadWorkOne = ceil(totalSymbolFrame * 1.0f / s_numthreads);
     uint tempOne = id.x * threadWorkOne;
     
-    //generate initial quantization
     for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
     {
+
+        //wipe some previous values
+        ErrorCorr[i].error = 0;
+        ErrorCorr[i].index = 0;
+        
         if(DictBuffer[i] != 0)
         {
             orig_prob[i] = DictBuffer[i] * 1.0f / totalSymbolFrame;
-            //change this maybe
-            quant_prob[i] = (float)(DictBuffer[i] * quantMult);
+            
+            quant_prob[i] = orig_prob[i] * L;
+            
             quant_round[i] = round(quant_prob[i]);
             
-            ErrorCorr[i].index = i;
-            ErrorCorr[i].error = pow(quant_prob[i] - quant_round[i], 2) / orig_prob[i];
+            if (quant_round[i] == 0)
+            {
+                quant_round[i]++;
+            }
             
-            g_used += quant_round[i];
+            InterlockedAdd(SymbolCount[1], quant_round[i]);
+            
+            ErrorCorr[i].index = i;
+            ErrorCorr[i].error = pow(quant_prob[i] - quant_round[i], 2.0f) / orig_prob[i];
         }
+    }
+    
+    if (id.x == 1)
+    {
+        SymbolCount[2] = L;
+    }
+    
+    //hold temporarily
+    
+    /*
+    DeviceMemoryBarrierWithGroupSync();
+    
+    int sign = 1;
+    if (SymbolCount[1] > SymbolCount[2])
+    {
+        sign = -1;
     }
     
     //correct for error
-    if(g_used != bigL)
+    if (SymbolCount[1] != SymbolCount[2])
     {
-        int sign;
-        if(g_used > bigL)
-        {
-            sign = -1;
-        }
-        else
-        {
-            sign = 1;
-        }
-        
         //calculate potential error corrections
         for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
         {
-            ErrorCorr[i].error = ErrorCorr[i].error - (pow(quant_prob[i] - (quant_round[i] + sign), 2) / orig_prob[i]);
+            if (DictBuffer[i] != 0)
+            {
+                if (quant_round[i] + sign)
+                {
+                    ErrorCorr[i].error = abs(ErrorCorr[i].error - (pow(quant_prob[i] - (quant_round[i] + sign), 2.0f) / orig_prob[i]));
+                }
+            }
         }
     }
-
-    DeviceMemoryBarrierWithGroupSync();
     
-    if (g_used != bigL)
+    DeviceMemoryBarrierWithGroupSync();
+*/
+}
+
+//this will need to be fixed
+[numthreads(256, 1, 1)]
+void CorrectSingle(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    uint threadWorkOne = ceil(e_arraySize * 1.0f / s_numthreads);
+    uint tempOne = id.x * threadWorkOne;
+    
+    int sign = 1;
+    if (SymbolCount[1] > SymbolCount[2])
     {
-        SortMain(gtid, ErrorCorr);
+        sign = -1;
+    }
+    
+    //correct for error
+    if (SymbolCount[1] != SymbolCount[2])
+    {
+        //calculate potential error corrections
+        for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
+        {
+            if (DictBuffer[i] != 0)
+            {
+                if (quant_round[i] + sign)
+                {
+                    ErrorCorr[i].error = abs(ErrorCorr[i].error - (pow(quant_prob[i] - (quant_round[i] + sign), 2.0f) / orig_prob[i]));
+                }
+                else
+                {
+                    ErrorCorr[i].error = 99999999;
+                }
+            }
+        }
     }
     
     DeviceMemoryBarrierWithGroupSync();
+    if(id.x == 1)
+    {
+        while (SymbolCount[1] != SymbolCount[2])
+        {
+            ErrorCorr[0].error = pow(quant_prob[ErrorCorr[0].index] - (quant_round[ErrorCorr[0].index] + sign), 2.0f) / orig_prob[ErrorCorr[0].index];
+            
+        //bubble down the correction
+            int index = 0;
+            while (ErrorCorr[index].error > ErrorCorr[index + 1].error)
+            {
+                errorArr l = ErrorCorr[index];
+                ErrorCorr[index] = ErrorCorr[index + 1];
+                ErrorCorr[index + 1] = l;
+                index++;
+            }
+
+            SymbolCount[1] += sign;
+        }
+    }
+    
+    DeviceMemoryBarrierWithGroupSync();
+    
+    //for our purposes we're going to always assume sorting is required
+    SortMain(gtid, ErrorCorr, quant_round, e_arraySize);
+    
 }
+
+[numthreads(256, 1, 1)]
+void CorrectMulti(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    uint threadWorkOne = ceil(e_arraySize * 1.0f / s_numthreads);
+    uint tempOne = id.x * threadWorkOne;
+    
+    // correction size = used - L
+    int correctionSize = SymbolCount[1] - SymbolCount[2];
+    int correctionStep = ceil(correctionSize / 2.0f);
+    
+    int sign = 1;
+    if (!correctionSize)
+    {
+        sign = -1;
+    }
+    
+    //correct for error
+    if (SymbolCount[1] != SymbolCount[2])
+    {
+        //Check for resiliancy to possible corrections
+        for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
+        {
+            if (DictBuffer[i] != 0)
+            {
+                if (quant_round[i] + sign)
+                {
+                    ErrorCorr[i].error = abs(ErrorCorr[i].error - (pow(quant_prob[i] - (quant_round[i] + sign), 2.0f) / orig_prob[i]));
+                }
+                else
+                {
+                    ErrorCorr[i].error = 99999999;
+                }
+            }
+            else
+            {
+                ErrorCorr[i].error = 99999999;
+            }
+        }
+    }
+    
+    DeviceMemoryBarrierWithGroupSync();
+    
+    SortMain(gtid, ErrorCorr, quant_round, e_arraySize);
+    
+    DeviceMemoryBarrierWithGroupSync();
+    
+    if (SymbolCount[1] != SymbolCount[2])
+    {
+        uint threadWorkTwo = ceil(SymbolCount[2] * 1.0f / s_numthreads);
+        uint tempTwo = id.x * threadWorkTwo;
+        //maximize correction for all symbols less than L
+        for(uint i = tempTwo; i < tempTwo + threadWorkTwo; i++)
+        {
+            int powMult = 2;
+            uint offset = 0;
+            float temp = ErrorCorr[i].error;
+            float originalError = pow(quant_prob[ErrorCorr[i].index] - quant_round[ErrorCorr[i].index], 2.0f) / orig_prob[ErrorCorr[i].index];
+            ErrorCorr[i].error = abs(originalError - (pow(quant_prob[ErrorCorr[i].index] - (quant_round[ErrorCorr[i].index] + (sign * powMult)), 2.0f) / orig_prob[ErrorCorr[i].index]));
+            //scuffed recursion
+            while(true)
+            {
+                while (ErrorCorr[i].error < temp)
+                {
+                    powMult <<= 1;
+                    temp = ErrorCorr[i].error;
+                    ErrorCorr[i].error = abs(originalError - (pow(quant_prob[ErrorCorr[i].index] - (quant_round[ErrorCorr[i].index] + offset + (sign * powMult)), 2.0f) / orig_prob[ErrorCorr[i].index]));
+                }
+                if ((powMult >> 1) == 1)
+                {
+                    break;
+                }
+              
+                offset += (sign * powMult);
+                sign *= -1;
+            
+                do
+                {
+                    powMult >>= 1;
+                    temp = ErrorCorr[i].error;
+                    ErrorCorr[i].error = abs(originalError - (pow(quant_prob[ErrorCorr[i].index] - (quant_round[ErrorCorr[i].index] + offset + (sign * powMult)), 2.0f) / orig_prob[ErrorCorr[i].index]));
+                } while (ErrorCorr[i].error < temp);
+                if((powMult << 1) == 2)
+                {
+                    break;
+                }
+                offset += (sign * powMult);
+                sign *= -1;
+                powMult = 1;
+                temp = ErrorCorr[i].error;
+                ErrorCorr[i].error = abs(originalError - (pow(quant_prob[ErrorCorr[i].index] - (quant_round[ErrorCorr[i].index] + offset + (sign * powMult)), 2.0f) / orig_prob[ErrorCorr[i].index]));
+            }
+        }
+    }
+}
+
+//prep for corrections
+[numthreads(256, 1, 1)]
+void BinaryTree(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    uint totalSymbolFrame = e_arraySize;
+    
+    //for testing purposes
+    //int L = calcL(SymbolCount[0]);
+    int L = 4096;
+
+    float quantMult = L * 1.0f / totalSymbolFrame;
+    
+    uint threadWorkOne = ceil(totalSymbolFrame * 1.0f / s_numthreads);
+    uint tempOne = id.x * threadWorkOne;
+    
+    for (uint i = tempOne; i < tempOne + threadWorkOne; i++)
+    {
+
+        //wipe some previous values
+        ErrorCorr[i].error = 0;
+        ErrorCorr[i].index = 0;
+        
+        if (DictBuffer[i] != 0)
+        {
+            orig_prob[i] = DictBuffer[i] * 1.0f / totalSymbolFrame;
+            
+            quant_prob[i] = orig_prob[i] * L;
+            
+            quant_round[i] = round(quant_prob[i]);
+            
+            if (quant_round[i] == 0)
+            {
+                quant_round[i]++;
+            }
+            
+            InterlockedAdd(SymbolCount[1], quant_round[i]);
+            
+            ErrorCorr[i].index = i;
+            ErrorCorr[i].error = pow(quant_prob[i] - quant_round[i], 2.0f) / orig_prob[i];
+        }
+    }
+}
+
+

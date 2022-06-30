@@ -1,0 +1,407 @@
+#pragma use_dxc
+#pragma shader_feature WAVE_SIZE_16 WAVE_SIZE_32 WAVE_SIZE_64
+#pragma kernel ParMerge
+#pragma kernel ParB
+#pragma kernel MergeB
+
+//wave size
+#define WAVE_SIZE 128
+//number of threadblocks
+#define NUM_BLOCKS 64
+//the size, in bytes, of a an element to be merged
+#define MERGE_VAR_SIZE 4
+//the max size, in bytes, of the groupshared memory cache
+#define GROUPSHARED_MAX_MEMORY 32768
+
+struct arguments
+{
+    uint threadGroupsX;
+    uint threadGroupsY;
+    uint threadGroupsZ;
+    uint baseVertexLocation;
+};
+
+//wavesize, determined from hardware
+RWStructuredBuffer<uint> b_waveSize;
+//the number of threadblocks should always be 64
+RWStructuredBuffer<arguments> b_mergeArgs;
+//index 0 is a
+//index 1 is b
+RWStructuredBuffer<uint> b_mergeLengths;
+//buffers to be merged
+RWStructuredBuffer<uint> b_mergeA;
+RWStructuredBuffer<uint> b_mergeB;
+//these two only for debugging;
+RWStructuredBuffer<uint> b_groupA;
+RWStructuredBuffer<uint> b_groupB;
+RWStructuredBuffer<uint> b_mergeOut;
+groupshared int g_mergeA[WAVE_SIZE];
+groupshared int g_mergeB[WAVE_SIZE];
+groupshared int g_intA[2];
+groupshared int g_intB[2];
+groupshared int offsetA;
+groupshared int offsetB;
+
+//vars for two dispatch method
+RWStructuredBuffer<int> t_mergeA;
+RWStructuredBuffer<int> t_mergeB;
+RWStructuredBuffer<int> t_groupA;
+RWStructuredBuffer<int> t_groupB;
+RWStructuredBuffer<int> t_mergeOut;
+groupshared int t_g_mergeA[WAVE_SIZE];
+groupshared int t_g_mergeB[WAVE_SIZE];
+extern int sizeA;
+extern int sizeB;
+
+[numthreads(WAVE_SIZE, 1, 1)]
+void ParMerge(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    int mergeLengthA = (int) b_mergeLengths[0];
+    int mergeLengthB = (int) b_mergeLengths[1];
+    int index, aTop, aBot, bTop, bBot, offset, aI, bI;
+    
+    if (gtid.x < 2)
+    {
+        if (gid.x != NUM_BLOCKS - 1)
+        {
+            index = (gid.x + 1 - gtid.x) * (mergeLengthA + mergeLengthB) / NUM_BLOCKS;
+        }
+        else
+        {
+            index = (NUM_BLOCKS - (gtid.x + 1)) * (mergeLengthA + mergeLengthB) / NUM_BLOCKS;
+        }
+        if (index > mergeLengthA)
+        {
+            aTop = mergeLengthA;
+            aBot = index - mergeLengthA;
+            bTop = mergeLengthA;
+            bBot = index - mergeLengthA;
+        }
+        else
+        {
+            aTop = index;
+            aBot = 0;
+            bTop = index;
+            bBot = 0;
+        }
+        while (true)
+        {
+            offset = abs(aTop - aBot) / 2;
+            aI = aTop - offset;
+            bI = bBot + offset;
+        
+            if (aI >= 0 && bI <= mergeLengthB && (b_mergeA[aI] > b_mergeB[bI - 1] || aI == mergeLengthA || bI == 0))
+            {
+                if (bI == mergeLengthB || aI == 0 || b_mergeA[aI - 1] <= b_mergeB[bI])
+                {
+                    //b_groupA[gid.x * 2 + gtid.x] = aI;
+                    //b_groupB[gid.x * 2 + gtid.x] = bI;
+                    g_intA[gtid.x] = aI;
+                    g_intB[gtid.x] = bI;
+                    break;
+                }
+                else
+                {
+                    bBot = bI + 1;
+                    aTop = aI - 1;
+                }
+            }
+            else
+            {
+                bTop = bI - 1;
+                aBot = aI + 1;
+            }
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    int startA, endA, startB, endB;
+    if (gid.x == 0)
+    {
+        startA = 0;
+        endA = g_intA[0];
+        startB = 0;
+        endB = g_intB[0];
+    }
+    else
+    {
+        if (gid.x == NUM_BLOCKS - 1)
+        {
+            startA = g_intA[0];
+            endA = mergeLengthA;
+            startB = g_intB[0];
+            endB = mergeLengthB;
+        }
+        else
+        {
+            startA = g_intA[1];
+            endA = g_intA[0];
+            startB = g_intB[1];
+            endB = g_intB[0];
+        }
+    }
+    
+    int iter_max = (WAVE_SIZE - 1 + (endB - startB) + (endA - startA)) / WAVE_SIZE;
+    int iter = 0;
+    offsetA = 0;
+    offsetB = 0;
+    do
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (startA + offsetA + gtid.x < endA)
+        {
+            g_mergeA[gtid.x] = b_mergeA[startA + offsetA + gtid.x];
+        }
+        if (startB + offsetB + gtid.x < endB)
+        {
+            g_mergeB[gtid.x] = b_mergeB[startB + offsetB + gtid.x];
+        }
+        
+        GroupMemoryBarrierWithGroupSync();
+        int sizeAshared = endA - startA - offsetA;
+        int sizeBshared = endB - startB - offsetB;
+        if (sizeAshared < 0)
+            sizeAshared = 0;
+        if (sizeAshared > WAVE_SIZE && sizeAshared != 0)
+            sizeAshared = WAVE_SIZE;
+        if (sizeBshared < 0)
+            sizeBshared = 0;
+        if (sizeBshared > WAVE_SIZE && sizeBshared != 0)
+            sizeBshared = WAVE_SIZE;
+        
+        if (gtid.x < sizeAshared + sizeBshared)
+        {
+            if (gtid.x > sizeAshared)
+            {
+                aTop = sizeAshared;
+                aBot = gtid.x - sizeAshared;
+                bTop = sizeAshared;
+                bBot = gtid.x - sizeAshared;
+            }
+            else
+            {
+                aTop = gtid.x;
+                aBot = 0;
+                bTop = gtid.x;
+                bBot = 0;
+            }
+            
+            while (true)
+            {
+                offset = abs(aTop - aBot) / 2;
+                aI = aTop - offset;
+                bI = bBot + offset;
+        
+                if (aI >= 0 && bI <= sizeBshared && (g_mergeA[aI] > g_mergeB[bI - 1] || aI == sizeAshared || bI == 0))
+                {
+                    if (bI == sizeBshared || aI == 0 || g_mergeA[aI - 1] <= g_mergeB[bI])
+                    {
+                        if (aI < sizeAshared && (bI == sizeBshared || g_mergeA[aI] <= g_mergeB[bI]))
+                        {
+                            b_mergeOut[startA + startB + gtid.x + iter * WAVE_SIZE] = g_mergeA[aI];
+                            InterlockedAdd(offsetA, 1);
+                        }
+                        else
+                        {
+                            b_mergeOut[startA + startB + gtid.x + iter * WAVE_SIZE] = g_mergeB[bI];
+                            InterlockedAdd(offsetB, 1);
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        bBot = bI + 1;
+                        aTop = aI - 1;
+                    }
+                }
+                else
+                {
+                    bTop = bI - 1;
+                    aBot = aI + 1;
+                }
+            }
+        }
+        iter++;
+    } while (iter < iter_max);
+}
+
+[numthreads(WAVE_SIZE, 1, 1)]
+void ParB(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    int index = (sizeA + sizeB) / NUM_BLOCKS * (gid.x + 1);
+    if (gid.x == NUM_BLOCKS - 1)
+    {
+        return;
+    }
+    
+    int a[2];
+    int b[2];
+    
+    int x = 0;
+    int y = 1;
+    
+    if (index > sizeA)
+    {
+        a[x] = index - sizeA;
+        a[y] = sizeA;
+        b[x] = sizeA;
+        b[y] = index - sizeA;
+    }
+    else
+    {
+        a[x] = 0;
+        a[y] = index;
+        b[x] = index;
+        b[y] = 0;
+    }
+    while (true)
+    {
+        int offset = abs(a[y] - b[y]) / 2;
+        int c[2] = { a[x] + offset, a[y] - offset };
+        if (c[y] >= 0 && c[x] <= sizeB && (t_mergeA[c[y]] > t_mergeB[c[x] - 1] || c[y] == sizeA || c[x] == 0))
+        {
+            if (c[x] == sizeB || c[y] == 0 || t_mergeA[c[y] - 1] <= t_mergeB[c[x]])
+            {
+                t_groupA[gid.x] = c[y];
+                t_groupB[gid.x] = c[x];
+                break;
+            }
+            else
+            {
+                a[x] = c[x] + 1;
+                a[y] = c[y] - 1;
+            }
+        }
+        else
+        {
+            b[x] = c[x] - 1;
+            b[y] = c[y] + 1;
+        }
+    }
+}
+
+[numthreads(WAVE_SIZE, 1, 1)]
+void MergeB(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    int startA, endA, startB, endB;
+    int x = 0;
+    int y = 1;
+    
+    if (gid.x == 0)
+    {
+        startA = 0;
+        endA = t_groupA[gid.x];
+        startB = 0;
+        endB = t_groupB[gid.x];
+    }
+    else
+    {
+        if (gid.x == NUM_BLOCKS - 1)
+        {
+            startA = t_groupA[gid.x - 1];
+            endA = sizeA;
+            startB = t_groupB[gid.x - 1];
+            endB = sizeB;
+        }
+        else
+        {
+            startA = t_groupA[gid.x - 1];
+            endA = t_groupA[gid.x];
+            startB = t_groupB[gid.x - 1];
+            endB = t_groupB[gid.x];
+        }
+    }
+    
+    int iter_max = (WAVE_SIZE - 1 + (endB - startB) + (endA - startA)) / WAVE_SIZE;
+    int iter = 0;
+    
+    offsetA = 0;
+    offsetB = 0;
+    
+    do
+    {
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (startA + offsetA + gtid.x < endA)
+        {
+            t_g_mergeA[gtid.x] = t_mergeA[startA + offsetA + gtid.x];
+        }
+        if (startB + offsetB + gtid.x < endB)
+        {
+            t_g_mergeB[gtid.x] = t_mergeB[startB + offsetB + gtid.x];
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+        
+        int sizeAshared = endA - startA - offsetA;
+        int sizeBshared = endB - startB - offsetB;
+        if (sizeAshared < 0)
+            sizeAshared = 0;
+        if (sizeAshared > WAVE_SIZE && sizeAshared != 0)
+            sizeAshared = WAVE_SIZE;
+        if (sizeBshared < 0)
+            sizeBshared = 0;
+        if (sizeBshared > WAVE_SIZE && sizeBshared != 0)
+            sizeBshared = WAVE_SIZE;
+        
+        int i = gtid.x;
+        
+        if (i < sizeAshared + sizeBshared)
+        {
+            int a[2];
+            int b[2];
+            
+            if (i > sizeAshared)
+            {
+                a[x] = i - sizeAshared;
+                a[y] = sizeAshared;
+                b[x] = sizeAshared;
+                b[y] = i - sizeAshared;
+            }
+            else
+            {
+                a[x] = 0;
+                a[y] = i;
+                b[x] = i;
+                b[y] = 0;
+            }
+            
+            while (true)
+            {
+                int offsetMain = abs(a[y] - b[y]) / 2;
+                int c[2] = { a[x] + offsetMain, a[y] - offsetMain };
+                
+                if (c[y] >= 0 && c[x] <= sizeBshared && (t_g_mergeA[c[y]] > t_g_mergeB[c[x] - 1] || c[y] == sizeAshared || c[x] == 0))
+                {
+                    if (c[x] == sizeBshared || c[y] == 0 || t_g_mergeA[c[y] - 1] <= t_g_mergeB[c[x]])
+                    {
+                        int idx = startA + startB + i + iter * WAVE_SIZE;
+                        if (c[y] < sizeAshared && (c[x] == sizeBshared || t_g_mergeA[c[y]] <= t_g_mergeB[c[x]]))
+                        {
+                            t_mergeOut[idx] = t_g_mergeA[c[y]];
+                            InterlockedAdd(offsetA, 1);
+                        }
+                        else
+                        {
+                            t_mergeOut[idx] = t_g_mergeB[c[x]];
+                            InterlockedAdd(offsetB, 1);
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        a[x] = c[x] + 1;
+                        a[y] = c[y] - 1;
+                    }
+                }
+                else
+                {
+                    b[x] = c[x] - 1;
+                    b[y] = c[y] + 1;
+                }
+            }
+        }
+        iter = iter + 1;
+    } while (iter < iter_max);
+
+}
