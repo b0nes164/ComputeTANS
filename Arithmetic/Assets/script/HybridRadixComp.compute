@@ -1,14 +1,508 @@
-// Each #kernel tells which function to compile; you can have many kernels
-#pragma kernel CSMain
+#pragma use_dxc
+#pragma kernel Init
+#pragma kernel DefaultHistogram
+#pragma kernel GroupedHistogram
+#pragma kernel WaveIntrinsicPrefixSum
+#pragma kernel ConventionalPrefixSum
 
-// Create a RenderTexture with enableRandomWrite flag and set it
-// with cs.SetTexture
-RWTexture2D<float4> Result;
+#define WAVE_SIZE 16
+#define GROUP_SIZE 32
+#define THREAD_BLOCKS 64
+#define MAX_GROUP 2048
+//(n-w)(w-1) + 1
+#define WAVES 17
 
-[numthreads(8,8,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+#define RADIX_BITS 8
+#define RADIX 256
+#define MASK 255
+#define MAX_KEY_BITS 16
+#define MAX_KEY_VAL 65536
+
+
+#define NUM_BANKS 16 
+#define LOG_NUM_BANKS 4 
+
+RWStructuredBuffer<uint> b_input;
+RWStructuredBuffer<uint> b_output;
+RWStructuredBuffer<uint> b_prefixes;
+RWStructuredBuffer<uint> b_check;
+RWStructuredBuffer<uint> b_globalHistogram;
+
+extern float e_seed;
+extern uint e_sortLength;
+
+
+groupshared uint g_waveTotal[GROUP_SIZE / WAVE_SIZE];
+groupshared uint g_hist[RADIX];
+groupshared uint g_tranHist[RADIX];
+groupshared uint g_tranHistTwo[WAVES + 1];
+groupshared uint counter;
+
+
+uint randTwo(float n, float seed, uint limit)
 {
-    // TODO: insert actual code here!
-
-    Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
+    return uint(frac(sin(n + seed) * 43758.5453) * limit);
 }
+
+//extract most significant digit
+uint ExtractDigit(uint _in, uint _pos)
+{
+    return (_in >> (RADIX_BITS * _pos)) & MASK;
+}
+
+uint ConflictOffset(uint _n)
+{
+    return ((_n) >> NUM_BANKS + (_n) >> (2 * LOG_NUM_BANKS));
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void Init(int3 id : SV_DispatchThreadID)
+{
+    uint length;
+    uint stride;
+    b_input.GetDimensions(length, stride);
+    uint threadWork = ceil(float(length) / (THREAD_BLOCKS * GROUP_SIZE));
+    
+    for (int i = id.x * threadWork; i < ((id.x + 1) * threadWork); i++)
+    {
+        b_input[i] = randTwo(i, e_seed, MAX_KEY_VAL);
+    }
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void DefaultHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID, int3 id : SV_DispatchThreadID)
+{
+    uint l_hist[RADIX] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0 };
+    uint l_sortLength = e_sortLength;
+    //int initialPosition = ceil(float(MAX_KEY_BITS) / RADIX_BITS) - 1;
+    uint initialPosition = 0;
+    int threadWork = ceil(l_sortLength / float(THREAD_BLOCKS * GROUP_SIZE));
+    
+    for (int i = id.x * threadWork; i < ((id.x + 1) * threadWork); i++)
+    {
+        g_hist[i] = 0;
+        b_prefixes[i] = 0;
+        b_globalHistogram[i] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    
+    //Wave histogram
+    //Test RLE histogram methods
+    for (int j = id.x * threadWork; j < ((id.x + 1) * threadWork); j++)
+    {
+        l_hist[ExtractDigit(b_input[j], 1)]++;
+    }
+    
+    for (int k = 0; k < RADIX; k++)
+    {
+        l_hist[k] = WaveActiveSum(l_hist[k]);
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    if (WaveIsFirstLane())
+    {
+        //create an offset for every insertion point. Once the loop iterator is past the max value, subtract the max value to 
+        //push value back to min value
+        int insertWork = gid.x * (GROUP_SIZE / WAVE_SIZE) + (gtid.x / WAVE_SIZE);
+        for (int a = insertWork; a < insertWork + RADIX; a++)
+        {
+            uint insertion = a < RADIX ? a : a - RADIX;
+            InterlockedAdd(g_hist[insertion], l_hist[insertion]);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    if(gtid.x == 0)
+    {
+        for (int b = gid.x; b < gid.x + RADIX; b++)
+        {
+            uint insertion = b < RADIX ? b : b - RADIX;
+            InterlockedAdd(b_globalHistogram[insertion], g_hist[insertion]);
+        }
+    }
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void GroupedHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID, int3 id : SV_DispatchThreadID)
+{
+    uint l_hist[RADIX] =
+    {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0
+    };
+    uint l_sortLength = e_sortLength;
+    //int initialPosition = ceil(float(MAX_KEY_BITS) / RADIX_BITS) - 1;
+    uint initialPosition = 0;
+    int threadWork = ceil(l_sortLength / float(THREAD_BLOCKS * GROUP_SIZE));
+    
+    for (int i = id.x * threadWork; i < ((id.x + 1) * threadWork); i++)
+    {
+        g_hist[i] = 0;
+        b_prefixes[i] = 0;
+        b_globalHistogram[i] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Wave histogram
+    //Test RLE histogram methods
+    for (int j = id.x * threadWork; j < ((id.x + 1) * threadWork); j++)
+    {
+        l_hist[ExtractDigit(b_input[j], 1)]++;
+    }
+    
+    for (int k = 0; k < RADIX; k++)
+    {
+        l_hist[k] = WaveActiveSum(l_hist[k]);
+    }
+        
+    if (WaveIsFirstLane())
+    {
+        //create an offset for every insertion point. Once the loop iterator is past the max value, subtract the max value to 
+        //push value back to min value
+        int insertWork = gid.x * (GROUP_SIZE / WAVE_SIZE) + (gtid.x / WAVE_SIZE);
+        for (int a = insertWork; a < insertWork + RADIX; a++)
+        {
+            uint insertion = a < RADIX ? a : a - RADIX;
+            InterlockedAdd(g_hist[insertion], l_hist[insertion]);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    int offset = 1;
+    for (int h = RADIX >> 1; h > 0; h >>= 1)
+    {
+        int localWork = ceil(h / float(GROUP_SIZE));
+        for (int g = gtid.x * localWork; g < (gtid.x + 1) * localWork; g++)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (g < h)
+            {
+                int aI = offset * (2 * g + 1) - 1;
+                int bI = offset * (2 * g + 2) - 1;
+                g_hist[bI] += g_hist[aI];
+            }
+        }
+        offset <<= 1;
+    }
+    
+    if (gtid.x == 0)
+    {
+        g_hist[RADIX - 1] = 0;
+    }
+    
+    for (int l = 1; l < RADIX; l <<= 1)
+    {
+        offset >>= 1;
+        int localWork = ceil(l / float(GROUP_SIZE));
+        for (int f = gtid.x * localWork; f < (gtid.x + 1) * localWork; f++)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (f < l)
+            {
+                int aI = offset * (2 * f + 1) - 1;
+                int bI = offset * (2 * f + 2) - 1;
+                int temp = g_hist[aI];
+                g_hist[aI] = g_hist[bI];
+                g_hist[bI] += temp;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gtid.x == 0)
+    {
+        for (int b = gid.x; b < gid.x + RADIX; b++)
+        {
+            uint insertion = b < RADIX ? b : b - RADIX;
+            InterlockedAdd(b_globalHistogram[insertion], g_hist[insertion]);
+        }
+    }
+}
+
+//speed almost identical
+//Wave intrinsic
+//number of waves needed is (n-w)/(w-1) + 1
+[numthreads(WAVES * WAVE_SIZE, 1, 1)]
+void WaveIntrinsicPrefixSum(int3 gtid : SV_GroupThreadID)
+{
+    g_tranHist[gtid.x] = b_globalHistogram[gtid.x];
+    GroupMemoryBarrierWithGroupSync();
+    
+    //first pass
+    int adjustment = gtid.x - floor(gtid.x / WAVE_SIZE);
+    uint temp = WavePrefixSum(g_tranHist[adjustment]);
+    
+    if(gtid.x < WAVE_SIZE)
+    {
+        g_tranHist[gtid.x] = temp;
+    }
+    else
+    {
+        if (!WaveIsFirstLane())
+        {
+            g_tranHist[adjustment] = temp;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //second pass
+    if(gtid.x < WAVE_SIZE)
+    {
+        g_tranHistTwo[gtid.x] = WavePrefixSum(g_tranHist[(gtid.x + 1) * (WAVE_SIZE - 1)]);
+        
+        temp = WavePrefixSum(g_tranHist[(gtid.x + WAVE_SIZE) * (WAVE_SIZE - 1)]);
+        if (!WaveIsFirstLane())
+        {
+            g_tranHistTwo[gtid.x + (WAVE_SIZE - 1)] = temp + g_tranHistTwo[WAVE_SIZE - 1];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    if (gtid.x > (WAVE_SIZE - 1))
+    {
+        b_globalHistogram[gtid.x] = g_tranHist[gtid.x] + g_tranHistTwo[floor((gtid.x - 1) / float(WAVE_SIZE - 1))];
+    }
+}
+
+//seemingly no speedup from conflict offset adjustment
+//speed almost identical
+//up sweep + down sweep no wave intrinsics
+[numthreads(RADIX, 1, 1)]
+void ConventionalPrefixSum(int3 gtid : SV_GroupThreadID)
+{
+    int aI = gtid.x;
+    int bI = gtid.x + (RADIX >> 1);
+    int bankOffsetA = ConflictOffset(aI);
+    int bankOffsetB = ConflictOffset(bI);
+    g_tranHist[aI + bankOffsetA] = b_globalHistogram[aI];
+    g_tranHist[bI + bankOffsetB] = b_globalHistogram[bI];
+    
+    int offset = 1;
+    for (int i = RADIX >> 1; i > 0; i >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (gtid.x < i)
+        {
+            aI = offset * (2 * gtid.x + 1) - 1;
+            aI += ConflictOffset(aI);
+            bI = offset * (2 * gtid.x + 2) - 1;
+            bI += ConflictOffset(bI);
+            g_tranHist[bI] += g_tranHist[aI];
+        }
+        
+        offset <<= 1;
+    }
+    
+    if(gtid.x == 0)
+    {
+        g_tranHist[RADIX - 1 + ConflictOffset(RADIX - 1)] = 0;
+    }
+    
+    for (int l = 1; l < RADIX; l <<= 1)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (gtid.x < l)
+        {
+            aI = offset * (2 * gtid.x + 1) - 1;
+            aI += ConflictOffset(aI);
+            bI = offset * (2 * gtid.x + 2) - 1;
+            bI += ConflictOffset(bI);
+            int temp = g_tranHist[aI];
+            g_tranHist[aI] = g_tranHist[bI];
+            g_tranHist[bI] += temp;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    b_globalHistogram[aI] = g_tranHist[aI + bankOffsetA];
+    b_globalHistogram[bI] = g_tranHist[bI + bankOffsetB];
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ScatterKeys(int3 gtid : SV_GroupThreadID)
+{
+}
+
+
+ 
+    /*
+        //create runs of size 8 to combine additions of same digit to increase memory bandwith effeciency
+        //hard code implementation of batcher oems of size eight
+        //cannot create a function here, array is pass by value only
+        for (int k = 0; k < RADIX; k+= 8)
+        {
+            //initial row
+            uint l = l_hist[k];
+            uint r = l_hist[k + 1];
+            if(r > l)
+            {
+                l_hist[k] = r;
+                l_hist[k + 1] = l;
+            }
+            
+            l = l_hist[k + 2];
+            r = l_hist[k + 3];
+            if (r > l)
+            {
+                l_hist[k + 2] = r;
+                l_hist[k + 3] = l;
+            }
+            
+            l = l_hist[k + 4];
+            r = l_hist[k + 5];
+            if (r > l)
+            {
+                l_hist[k + 4] = r;
+                l_hist[k + 5] = l;
+            }
+            
+            l = l_hist[k + 6];
+            r = l_hist[k + 7];
+            if (r > l)
+            {
+                l_hist[k + 6] = r;
+                l_hist[k + 7] = l;
+            }
+            
+            //second row
+            l = l_hist[k];
+            r = l_hist[k + 2];
+            if (r > l)
+            {
+                l_hist[k] = r;
+                l_hist[k + 2] = l;
+            }
+            
+            l = l_hist[k + 4];
+            r = l_hist[k + 6];
+            if (r > l)
+            {
+                l_hist[k + 4] = r;
+                l_hist[k + 6] = l;
+            }
+            
+            l = l_hist[k + 1];
+            r = l_hist[k + 3];
+            if (r > l)
+            {
+                l_hist[k + 1] = r;
+                l_hist[k + 3] = l;
+            }
+            
+            l = l_hist[k + 5];
+            r = l_hist[k + 7];
+            if (r > l)
+            {
+                l_hist[k + 5] = r;
+                l_hist[k + 7] = l;
+            }
+            
+            l = l_hist[k + 1];
+            r = l_hist[k + 2];
+            if (r > l)
+            {
+                l_hist[k + 1] = r;
+                l_hist[k + 2] = l;
+            }
+            
+            l = l_hist[k + 5];
+            r = l_hist[k + 6];
+            if (r > l)
+            {
+                l_hist[k + 5] = r;
+                l_hist[k + 6] = l;
+            }
+            
+            //thid row
+            l = l_hist[k];
+            r = l_hist[k + 4];
+            if (r > l)
+            {
+                l_hist[k] = r;
+                l_hist[k + 4] = l;
+            }
+            
+            l = l_hist[k + 1];
+            r = l_hist[k + 5];
+            if (r > l)
+            {
+                l_hist[k + 1] = r;
+                l_hist[k + 5] = l;
+            }
+            
+            l = l_hist[k + 2];
+            r = l_hist[k + 6];
+            if (r > l)
+            {
+                l_hist[k + 2] = r;
+                l_hist[k + 6] = l;
+            }
+            
+            l = l_hist[k + 3];
+            r = l_hist[k + 7];
+            if (r > l)
+            {
+                l_hist[k + 3] = r;
+                l_hist[k + 7] = l;
+            }
+            
+            l = l_hist[k + 2];
+            r = l_hist[k + 4];
+            if (r > l)
+            {
+                l_hist[k + 2] = r;
+                l_hist[k + 4] = l;
+            }
+            
+            l = l_hist[k + 3];
+            r = l_hist[k + 5];
+            if (r > l)
+            {
+                l_hist[k + 3] = r;
+                l_hist[k + 5] = l;
+            }
+            
+            //last row
+            l = l_hist[k + 1];
+            r = l_hist[k + 2];
+            if (r > l)
+            {
+                l_hist[k + 1] = r;
+                l_hist[k + 2] = l;
+            }
+            
+            l = l_hist[k + 3];
+            r = l_hist[k + 4];
+            if (r > l)
+            {
+                l_hist[k + 3] = r;
+                l_hist[k + 4] = l;
+            }
+            
+            l = l_hist[k + 5];
+            r = l_hist[k + 6];
+            if (r > l)
+            {
+                l_hist[k + 5] = r;
+                l_hist[k + 6] = l;
+            }
+        }
+        
+        //combine additions of same counter using RLE
+        int rle = 1;
+        for (int l = 0; l < RADIX; l++)
+        {
+            
+        }
+        */
