@@ -12,17 +12,19 @@ public class HybridRadix : MonoBehaviour
     [SerializeField]
     private DispatchTester tester;
 
+    private static int radix = 256;
     private static int threadBlocks = 64;
     private static int groupSize = 32;
-    private static int size = 2048;
+    private static int size = 32768;
     private static int max = 65536;
     private static int[] arr = new int[size];
 
     private static int k_init = 0;
     private static int k_dHist = 1;
     private static int k_gHist = 2;
-    private static int k_wavePrefix = 3;
-    private static int k_conPrefix = 4;
+    private static int k_tHist = 3;
+    private static int k_wavePrefix = 4;
+    private static int k_conPrefix = 5;
 
     private ComputeBuffer b_args;
     private ComputeBuffer b_input;
@@ -41,48 +43,47 @@ public class HybridRadix : MonoBehaviour
         b_input = new ComputeBuffer(size, sizeof(uint));
         b_output = new ComputeBuffer(size, sizeof(uint));
         b_prefixes = new ComputeBuffer(size, sizeof(uint));
-        b_globalHistogram = new ComputeBuffer(256, sizeof(uint));
-        b_tempHist = new ComputeBuffer(threadBlocks * groupSize, sizeof(uint));
+        b_globalHistogram = new ComputeBuffer(radix, sizeof(uint));
+        b_tempHist = new ComputeBuffer(threadBlocks * radix, sizeof(uint));
         b_check = new ComputeBuffer(size, sizeof(uint));
 
-        b_args.SetData(new uint[] { (uint)threadBlocks, 1, 1, 0 });
+        b_args.SetData(new uint[] { 64, 1, 1, 0 });
         compute.SetFloat("e_seed", (float)rand.NextDouble());
         compute.SetInt("e_sortLength", size);
 
         compute.SetBuffer(k_init,"b_input", b_input);
-        //compute.DispatchIndirect(k_init, b_args);
+        compute.DispatchIndirect(k_init, b_args);
 
-        compute.SetBuffer(k_dHist, "b_globalHistogram", b_globalHistogram);
-        compute.SetBuffer(k_dHist, "b_input", b_input);
-        compute.SetBuffer(k_dHist, "b_prefixes", b_prefixes);
-        //compute.DispatchIndirect(k_dHist, b_args);
+        compute.SetBuffer(k_tHist, "b_globalHistogram", b_globalHistogram);
+        compute.SetBuffer(k_tHist, "b_tempHist", b_tempHist);
+        compute.SetBuffer(k_tHist, "b_input", b_input);
+        compute.SetBuffer(k_tHist, "b_prefixes", b_prefixes);
+        compute.DispatchIndirect(k_tHist, b_args);
 
-        compute.SetBuffer(k_gHist, "b_globalHistogram", b_globalHistogram);
-        compute.SetBuffer(k_gHist, "b_input", b_input);
-        compute.SetBuffer(k_gHist, "b_prefixes", b_prefixes);
-        //compute.DispatchIndirect(k_gHist, b_args);
-
-        compute.SetBuffer(k_wavePrefix, "b_globalHistogram", b_globalHistogram);
-        //compute.Dispatch(k_wavePrefix, 1, 1, 1);
-
-        compute.SetBuffer(k_conPrefix, "b_globalHistogram", b_globalHistogram);
-        //compute.Dispatch(k_conPrefix, 1, 1, 1);
+        uint[] test2 = new uint[b_tempHist.count];
+        b_tempHist.GetData(test2);
+        uint counter = 0;
+        foreach(uint x in test2)
+        {
+            counter += x;
+        }
 
         uint[] test = new uint[b_globalHistogram.count];
         b_globalHistogram.GetData(test);
-
+        uint total = 0;
         foreach (uint g in test)
         {
             //Debug.Log(g);
+            total += g;
         }
 
-        Test();
+        Debug.Log(counter);
+        Debug.Log(total);
     }
 
     private void Test()
     {
-        tester.Initialize(500, 100, 2, compute, false);
-        tester.InitDispatch(1, k_init, k_dHist, k_conPrefix, b_args, b_globalHistogram);
+        tester.Initialize(500, 100, 1, compute, false);
         tester.InitDispatch(0, k_init, k_gHist, b_args, b_globalHistogram);
         StartCoroutine(tester.TestMaster());
     }

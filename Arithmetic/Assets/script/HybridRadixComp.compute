@@ -2,6 +2,7 @@
 #pragma kernel Init
 #pragma kernel DefaultHistogram
 #pragma kernel GroupedHistogram
+#pragma kernel ThreadReducedHistogram
 #pragma kernel WaveIntrinsicPrefixSum
 #pragma kernel ConventionalPrefixSum
 
@@ -27,6 +28,7 @@ RWStructuredBuffer<uint> b_output;
 RWStructuredBuffer<uint> b_prefixes;
 RWStructuredBuffer<uint> b_check;
 RWStructuredBuffer<uint> b_globalHistogram;
+RWStructuredBuffer<uint> b_tempHist;
 
 extern float e_seed;
 extern uint e_sortLength;
@@ -34,6 +36,7 @@ extern uint e_sortLength;
 
 groupshared uint g_waveTotal[GROUP_SIZE / WAVE_SIZE];
 groupshared uint g_hist[RADIX];
+groupshared uint g_cHist[THREAD_BLOCKS];
 groupshared uint g_tranHist[RADIX];
 groupshared uint g_tranHistTwo[WAVES + 1];
 groupshared uint counter;
@@ -227,6 +230,287 @@ void GroupedHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID, int3 
             InterlockedAdd(b_globalHistogram[insertion], g_hist[insertion]);
         }
     }
+    
+    for (int c = gtid.x; c < RADIX; c += GROUP_SIZE)
+    {
+        b_tempHist[c + gid.x * RADIX] = g_hist[c];
+    }
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ThreadReducedHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    uint l_sortLength = e_sortLength;
+    uint l_hist[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    //int initialPosition = ceil(float(MAX_KEY_BITS) / RADIX_BITS) - 1;
+    uint initialPosition = 0;
+    int groupWork = ceil(l_sortLength / float(THREAD_BLOCKS));
+    
+    for (int i = gid.x * groupWork + gtid.x; i < (gid.x + 1) * groupWork; i += GROUP_SIZE)
+    {
+        if (i < RADIX)
+        {
+            g_hist[i] = 0;
+            b_globalHistogram[i] = 0;
+        }
+        b_tempHist[i] = 0;
+        b_prefixes[i] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    uint counter = 0;
+    for (int k = gid.x * groupWork + gtid.x; k < (gid.x + 1) * groupWork; k += GROUP_SIZE)
+    {
+        if(k < l_sortLength)
+        {
+            l_hist[counter] = ExtractDigit(b_input[k], 1);
+            b_prefixes[k] = l_hist[counter];
+            counter++;
+            
+            //create runs of size 8 to combine additions of same digit to increase memory bandwith effeciency
+            //hard code implementation of batcher oems of size eight
+            if (counter == 8)
+            {
+                uint l = l_hist[0];
+                uint r = l_hist[1];
+                
+                //first row
+                if (r > l)
+                {
+                    l_hist[0] = r;
+                    l_hist[1] = l;
+                }
+            
+                l = l_hist[2];
+                r = l_hist[3];
+                if (r > l)
+                {
+                    l_hist[2] = r;
+                    l_hist[3] = l;
+                }
+            
+                l = l_hist[4];
+                r = l_hist[5];
+                if (r > l)
+                {
+                    l_hist[4] = r;
+                    l_hist[5] = l;
+                }
+            
+                l = l_hist[6];
+                r = l_hist[7];
+                if (r > l)
+                {
+                    l_hist[6] = r;
+                    l_hist[7] = l;
+                }
+            
+                //second row
+                l = l_hist[0];
+                r = l_hist[2];
+                if (r > l)
+                {
+                    l_hist[0] = r;
+                    l_hist[2] = l;
+                }
+            
+                l = l_hist[4];
+                r = l_hist[6];
+                if (r > l)
+                {
+                    l_hist[4] = r;
+                    l_hist[6] = l;
+                }
+            
+                l = l_hist[1];
+                r = l_hist[3];
+                if (r > l)
+                {
+                    l_hist[1] = r;
+                    l_hist[3] = l;
+                }
+            
+                l = l_hist[5];
+                r = l_hist[7];
+                if (r > l)
+                {
+                    l_hist[5] = r;
+                    l_hist[7] = l;
+                }
+            
+                l = l_hist[1];
+                r = l_hist[2];
+                if (r > l)
+                {
+                    l_hist[1] = r;
+                    l_hist[2] = l;
+                }
+            
+                l = l_hist[5];
+                r = l_hist[6];
+                if (r > l)
+                {
+                    l_hist[5] = r;
+                    l_hist[6] = l;
+                }
+            
+                //thid row
+                l = l_hist[0];
+                r = l_hist[4];
+                if (r > l)
+                {
+                    l_hist[0] = r;
+                    l_hist[4] = l;
+                }
+            
+                l = l_hist[1];
+                r = l_hist[5];
+                if (r > l)
+                {
+                    l_hist[1] = r;
+                    l_hist[5] = l;
+                }
+            
+                l = l_hist[2];
+                r = l_hist[6];
+                if (r > l)
+                {
+                    l_hist[2] = r;
+                    l_hist[6] = l;
+                }
+            
+                l = l_hist[3];
+                r = l_hist[7];
+                if (r > l)
+                {
+                    l_hist[3] = r;
+                    l_hist[7] = l;
+                }
+            
+                l = l_hist[2];
+                r = l_hist[4];
+                if (r > l)
+                {
+                    l_hist[2] = r;
+                    l_hist[4] = l;
+                }
+            
+                l = l_hist[3];
+                r = l_hist[5];
+                if (r > l)
+                {
+                    l_hist[3] = r;
+                    l_hist[5] = l;
+                }
+            
+                //last row
+                l = l_hist[1];
+                r = l_hist[2];
+                if (r > l)
+                {
+                    l_hist[1] = r;
+                    l_hist[2] = l;
+                }
+            
+                l = l_hist[3];
+                r = l_hist[4];
+                if (r > l)
+                {
+                    l_hist[3] = r;
+                    l_hist[4] = l;
+                }
+            
+                l = l_hist[5];
+                r = l_hist[6];
+                if (r > l)
+                {
+                    l_hist[5] = r;
+                    l_hist[6] = l;
+                }
+                
+                int rle = 1;
+                for (int j = 1; j < 8; j++)
+                {
+                    if (l_hist[j - 1] == l_hist[j])
+                    {
+                        rle++;
+                    }
+                    else
+                    {
+                        InterlockedAdd(g_hist[l_hist[j - 1]], rle);
+                        rle = 1;
+                    }
+                }
+                InterlockedAdd(g_hist[l_hist[7]], rle);
+                counter = 0;
+            }
+        }
+    }
+    //ensure histogram has proper empty values for the final pass
+    //probably a more elegant way to do this
+    for(int z = counter; z < 8; z++)
+    {
+        l_hist[z] = 0;
+    }
+    
+    //catch if there are remaining digits in the local histogram
+    //sort will be done with insertion sort for simplicity
+    if (counter > 0)
+    {
+        int iter = 1;
+        while (iter < counter + 1)
+        {
+            int l = l_hist[iter];
+            int r = iter - 1;
+            while (r >= 0 && l_hist[r] < l)
+            {
+                l_hist[r + 1] = l_hist[r];
+                r--;
+            }
+            l_hist[r + 1] = l;
+            iter++;
+        }
+        
+        int rle = 1;
+        for (int h = 1; h < counter + 1; h++)
+        {
+            if (l_hist[h - 1] == 0)
+            {
+                InterlockedAdd(g_hist[0], 1);
+            }
+            else
+            {
+                if (l_hist[h - 1] == l_hist[h])
+                {
+                    rle++;
+                }
+                else
+                {
+                    InterlockedAdd(g_hist[l_hist[h - 1]], rle);
+                    rle = 1;
+                }
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //push group values to temporary histogram
+    //temp histogram is of size THREAD_BLOCKS * RADIX
+    //group digits together for later better memory access
+    for(int a = gtid.x; a < RADIX; a += GROUP_SIZE)
+    {
+        b_tempHist[gid.x + (a * THREAD_BLOCKS)] = g_hist[a];
+    }
+
+    //push group values to the global histogram for total
+    if (gtid.x == 0)
+    {
+        for (int b = gid.x; b < gid.x + RADIX; b++)
+        {
+            uint insertion = b < RADIX ? b : b - RADIX;
+            InterlockedAdd(b_globalHistogram[insertion], g_hist[insertion]);
+        }
+    }
 }
 
 //speed almost identical
@@ -330,179 +614,60 @@ void ConventionalPrefixSum(int3 gtid : SV_GroupThreadID)
 }
 
 [numthreads(GROUP_SIZE, 1, 1)]
-void ScatterKeys(int3 gtid : SV_GroupThreadID)
+void ComponentWisePrefix(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
 {
+    //pull values from temporary global buffer
+    for (int i = gtid.x; i < THREAD_BLOCKS; i += GROUP_SIZE)
+    {
+        g_cHist[i] = b_tempHist[(gid.x * THREAD_BLOCKS) + i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    int offset = 1;
+    for (int j = THREAD_BLOCKS >> 1; j > 0; j >>= 1)
+    {
+        int localWork = ceil(j / float(GROUP_SIZE));
+        for (int k = gtid.x * localWork; k < (gtid.x + 1) * localWork; k++)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (k < j)
+            {
+                int aI = offset * (2 * k + 1) - 1;
+                int bI = offset * (2 * k + 2) - 1;
+                g_hist[bI] += g_hist[aI];
+            }
+        }
+        offset <<= 1;
+    }
+    
+    if (gtid.x == 0)
+    {
+        g_hist[THREAD_BLOCKS - 1] = 0;
+    }
+    
+    for (int g = 1; g < THREAD_BLOCKS; g <<= 1)
+    {
+        offset >>= 1;
+        int localWork = ceil(g / float(GROUP_SIZE));
+        for (int h = gtid.x * localWork; h < (gtid.x + 1) * localWork; h++)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (h < g)
+            {
+                int aI = offset * (2 * h + 1) - 1;
+                int bI = offset * (2 * h + 2) - 1;
+                int temp = g_hist[aI];
+                g_hist[aI] = g_hist[bI];
+                g_hist[bI] += temp;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
 }
 
-
- 
-    /*
-        //create runs of size 8 to combine additions of same digit to increase memory bandwith effeciency
-        //hard code implementation of batcher oems of size eight
-        //cannot create a function here, array is pass by value only
-        for (int k = 0; k < RADIX; k+= 8)
-        {
-            //initial row
-            uint l = l_hist[k];
-            uint r = l_hist[k + 1];
-            if(r > l)
-            {
-                l_hist[k] = r;
-                l_hist[k + 1] = l;
-            }
-            
-            l = l_hist[k + 2];
-            r = l_hist[k + 3];
-            if (r > l)
-            {
-                l_hist[k + 2] = r;
-                l_hist[k + 3] = l;
-            }
-            
-            l = l_hist[k + 4];
-            r = l_hist[k + 5];
-            if (r > l)
-            {
-                l_hist[k + 4] = r;
-                l_hist[k + 5] = l;
-            }
-            
-            l = l_hist[k + 6];
-            r = l_hist[k + 7];
-            if (r > l)
-            {
-                l_hist[k + 6] = r;
-                l_hist[k + 7] = l;
-            }
-            
-            //second row
-            l = l_hist[k];
-            r = l_hist[k + 2];
-            if (r > l)
-            {
-                l_hist[k] = r;
-                l_hist[k + 2] = l;
-            }
-            
-            l = l_hist[k + 4];
-            r = l_hist[k + 6];
-            if (r > l)
-            {
-                l_hist[k + 4] = r;
-                l_hist[k + 6] = l;
-            }
-            
-            l = l_hist[k + 1];
-            r = l_hist[k + 3];
-            if (r > l)
-            {
-                l_hist[k + 1] = r;
-                l_hist[k + 3] = l;
-            }
-            
-            l = l_hist[k + 5];
-            r = l_hist[k + 7];
-            if (r > l)
-            {
-                l_hist[k + 5] = r;
-                l_hist[k + 7] = l;
-            }
-            
-            l = l_hist[k + 1];
-            r = l_hist[k + 2];
-            if (r > l)
-            {
-                l_hist[k + 1] = r;
-                l_hist[k + 2] = l;
-            }
-            
-            l = l_hist[k + 5];
-            r = l_hist[k + 6];
-            if (r > l)
-            {
-                l_hist[k + 5] = r;
-                l_hist[k + 6] = l;
-            }
-            
-            //thid row
-            l = l_hist[k];
-            r = l_hist[k + 4];
-            if (r > l)
-            {
-                l_hist[k] = r;
-                l_hist[k + 4] = l;
-            }
-            
-            l = l_hist[k + 1];
-            r = l_hist[k + 5];
-            if (r > l)
-            {
-                l_hist[k + 1] = r;
-                l_hist[k + 5] = l;
-            }
-            
-            l = l_hist[k + 2];
-            r = l_hist[k + 6];
-            if (r > l)
-            {
-                l_hist[k + 2] = r;
-                l_hist[k + 6] = l;
-            }
-            
-            l = l_hist[k + 3];
-            r = l_hist[k + 7];
-            if (r > l)
-            {
-                l_hist[k + 3] = r;
-                l_hist[k + 7] = l;
-            }
-            
-            l = l_hist[k + 2];
-            r = l_hist[k + 4];
-            if (r > l)
-            {
-                l_hist[k + 2] = r;
-                l_hist[k + 4] = l;
-            }
-            
-            l = l_hist[k + 3];
-            r = l_hist[k + 5];
-            if (r > l)
-            {
-                l_hist[k + 3] = r;
-                l_hist[k + 5] = l;
-            }
-            
-            //last row
-            l = l_hist[k + 1];
-            r = l_hist[k + 2];
-            if (r > l)
-            {
-                l_hist[k + 1] = r;
-                l_hist[k + 2] = l;
-            }
-            
-            l = l_hist[k + 3];
-            r = l_hist[k + 4];
-            if (r > l)
-            {
-                l_hist[k + 3] = r;
-                l_hist[k + 4] = l;
-            }
-            
-            l = l_hist[k + 5];
-            r = l_hist[k + 6];
-            if (r > l)
-            {
-                l_hist[k + 5] = r;
-                l_hist[k + 6] = l;
-            }
-        }
-        
-        //combine additions of same counter using RLE
-        int rle = 1;
-        for (int l = 0; l < RADIX; l++)
-        {
-            
-        }
-        */
+[numthreads(GROUP_SIZE, 1, 1)]
+void ScatterKeys(int3 id : SV_DispatchThreadID, int3 gtid : SV_GroupThreadID)
+{
+    
+}
