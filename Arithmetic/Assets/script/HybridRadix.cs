@@ -25,6 +25,7 @@ public class HybridRadix : MonoBehaviour
     private static int k_tHist = 3;
     private static int k_wavePrefix = 4;
     private static int k_conPrefix = 5;
+    private static int k_compPrefix = 6;
 
     private ComputeBuffer b_args;
     private ComputeBuffer b_input;
@@ -60,12 +61,16 @@ public class HybridRadix : MonoBehaviour
         compute.SetBuffer(k_tHist, "b_prefixes", b_prefixes);
         compute.DispatchIndirect(k_tHist, b_args);
 
+        compute.SetBuffer(k_compPrefix, "b_tempHist", b_tempHist);
+        compute.DispatchIndirect(k_compPrefix, b_args);
+
+
         uint[] test2 = new uint[b_tempHist.count];
         b_tempHist.GetData(test2);
         uint counter = 0;
         foreach(uint x in test2)
         {
-            counter += x;
+            Debug.Log(x);
         }
 
         uint[] test = new uint[b_globalHistogram.count];
@@ -76,8 +81,6 @@ public class HybridRadix : MonoBehaviour
             //Debug.Log(g);
             total += g;
         }
-
-        Debug.Log(counter);
         Debug.Log(total);
     }
 

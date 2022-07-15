@@ -5,6 +5,8 @@
 #pragma kernel ThreadReducedHistogram
 #pragma kernel WaveIntrinsicPrefixSum
 #pragma kernel ConventionalPrefixSum
+#pragma kernel ComponentWisePrefix
+#pragma kernel ScatterKeys
 
 #define WAVE_SIZE 16
 #define GROUP_SIZE 32
@@ -616,54 +618,65 @@ void ConventionalPrefixSum(int3 gtid : SV_GroupThreadID)
 [numthreads(GROUP_SIZE, 1, 1)]
 void ComponentWisePrefix(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
 {
-    //pull values from temporary global buffer
-    for (int i = gtid.x; i < THREAD_BLOCKS; i += GROUP_SIZE)
+    //for each digit of the radix
+    int digitsPerBlock = RADIX / THREAD_BLOCKS;
+    for (int a = 0; a < digitsPerBlock; a++)
     {
-        g_cHist[i] = b_tempHist[(gid.x * THREAD_BLOCKS) + i];
-    }
-    GroupMemoryBarrierWithGroupSync();
-    
-    int offset = 1;
-    for (int j = THREAD_BLOCKS >> 1; j > 0; j >>= 1)
-    {
-        int localWork = ceil(j / float(GROUP_SIZE));
-        for (int k = gtid.x * localWork; k < (gtid.x + 1) * localWork; k++)
+        //pull values from temporary global buffer
+        for (int i = gtid.x; i < THREAD_BLOCKS; i += GROUP_SIZE)
         {
-            GroupMemoryBarrierWithGroupSync();
-            if (k < j)
+            g_cHist[i] = b_tempHist[((gid.x * digitsPerBlock) + a) * THREAD_BLOCKS + i];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    
+        //prefix sum
+        int offset = 1;
+        for (int j = THREAD_BLOCKS >> 1; j > 0; j >>= 1)
+        {
+            int localWork = ceil(j / float(GROUP_SIZE));
+            for (int k = gtid.x * localWork; k < (gtid.x + 1) * localWork; k++)
             {
-                int aI = offset * (2 * k + 1) - 1;
-                int bI = offset * (2 * k + 2) - 1;
-                g_hist[bI] += g_hist[aI];
+                GroupMemoryBarrierWithGroupSync();
+                if (k < j)
+                {
+                    int aI = offset * (2 * k + 1) - 1;
+                    int bI = offset * (2 * k + 2) - 1;
+                    g_cHist[bI] += g_cHist[aI];
+                }
+            }
+            offset <<= 1;
+        }
+    
+        if (gtid.x == 0)
+        {
+            g_cHist[THREAD_BLOCKS - 1] = 0;
+        }
+    
+        for (int g = 1; g < THREAD_BLOCKS; g <<= 1)
+        {
+            offset >>= 1;
+            int localWork = ceil(g / float(GROUP_SIZE));
+            for (int h = gtid.x * localWork; h < (gtid.x + 1) * localWork; h++)
+            {
+                GroupMemoryBarrierWithGroupSync();
+                if (h < g)
+                {
+                    int aI = offset * (2 * h + 1) - 1;
+                    int bI = offset * (2 * h + 2) - 1;
+                    int temp = g_cHist[aI];
+                    g_cHist[aI] = g_cHist[bI];
+                    g_cHist[bI] += temp;
+                }
             }
         }
-        offset <<= 1;
-    }
-    
-    if (gtid.x == 0)
-    {
-        g_hist[THREAD_BLOCKS - 1] = 0;
-    }
-    
-    for (int g = 1; g < THREAD_BLOCKS; g <<= 1)
-    {
-        offset >>= 1;
-        int localWork = ceil(g / float(GROUP_SIZE));
-        for (int h = gtid.x * localWork; h < (gtid.x + 1) * localWork; h++)
-        {
-            GroupMemoryBarrierWithGroupSync();
-            if (h < g)
-            {
-                int aI = offset * (2 * h + 1) - 1;
-                int bI = offset * (2 * h + 2) - 1;
-                int temp = g_hist[aI];
-                g_hist[aI] = g_hist[bI];
-                g_hist[bI] += temp;
-            }
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
+        GroupMemoryBarrierWithGroupSync();
 
+        //push back into the temp global buffer
+        for (int l = gtid.x; l < THREAD_BLOCKS; l += GROUP_SIZE)
+        {
+            b_tempHist[((gid.x * digitsPerBlock) + a) * THREAD_BLOCKS + l] = g_cHist[l];
+        }
+    }
 }
 
 [numthreads(GROUP_SIZE, 1, 1)]
